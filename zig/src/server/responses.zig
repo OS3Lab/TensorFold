@@ -9,6 +9,7 @@ const sse = @import("sse.zig");
 const pyrepr = @import("pyrepr.zig");
 const ids = @import("ids.zig");
 const translate_mod = @import("responses_translate.zig");
+const compat = @import("responses_compat.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
@@ -170,8 +171,11 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             .ok => |v| v,
             .err => return refuse(conn, a, "the request body is not JSON", 400, null),
         };
-        const r = translate_mod.translate(&cx, body, History{ .srv = srv }) catch return refuse(conn, a, cx.message, 400, null);
-        break :blk .{ r, body };
+        const bridge = compat.prepare(&cx, body) catch return refuse(conn, a, cx.message, 400, "tools");
+        const r = translate_mod.translate(&cx, bridge.body, History{ .srv = srv }) catch return refuse(conn, a, cx.message, 400, null);
+        r.echo.put(a, "tools", body.get("tools") orelse .{ .array = &.{} }) catch return;
+        r.echo.put(a, "tool_choice", body.get("tool_choice") orelse .{ .string = "auto" }) catch return;
+        break :blk .{ r, body, bridge };
     };
     const t = request[0];
     const base = json.newObject(a) catch return;
@@ -185,13 +189,16 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     base.put(a, "output", .{ .array = &.{} }) catch return;
     base.put(a, "usage", .null) catch return;
     for (t.echo.keys(), t.echo.values()) |k, v| base.put(a, k, v) catch return;
-    var reply: Reply = .{ .srv = srv, .a = a, .conn = conn, .base = base, .streaming = t.stream, .keep = t.store, .added = t.added, .cx = &cx };
+    var reply: Reply = .{ .srv = srv, .a = a, .conn = conn, .base = base, .streaming = t.stream, .keep = t.store, .added = t.added, .cx = &cx, .bridge = request[2] };
     var out: Wire = .{ .reply = &reply };
     openai.run(srv, a, out.out(), .{ .conn = conn }, true, t.chat);
     if (out.opened or conn.broken) return;
     const status = out.status orelse return;
     if (status != 200) return routes.sendValue(conn, a, status, out.payload);
-    const final = reply.completion(out.payload) catch return;
+    const final = reply.completion(out.payload) catch {
+        if (reply.final) |failed| return routes.sendValue(conn, a, 500, failed);
+        return;
+    };
     routes.sendValue(conn, a, 200, final);
 }
 
@@ -235,6 +242,8 @@ const Reply = struct {
     keep: bool,
     added: []Value,
     cx: *Cx,
+    bridge: compat.Prepared,
+    custom_arguments: std.AutoHashMapUnmanaged(*json.Object, std.ArrayList(u8)) = .empty,
     items: std.ArrayList(*json.Object) = .empty,
     current: ?*json.Object = null,
     calls: std.AutoArrayHashMapUnmanaged(i64, *json.Object) = .empty,
@@ -301,11 +310,14 @@ const Reply = struct {
             try r.put(part.?, "type", .{ .string = "reasoning_text" });
             try r.put(part.?, "text", .{ .string = "" });
         } else {
+            const binding = r.bridge.find(name);
+            const custom = if (binding) |b| b.custom else false;
             try r.put(item, "id", .{ .string = ids.make(r.a, "fc_", 32) catch return error.Closed });
-            try r.put(item, "type", .{ .string = "function_call" });
+            try r.put(item, "type", .{ .string = if (custom) "custom_tool_call" else "function_call" });
             try r.put(item, "call_id", .{ .string = call_id });
-            try r.put(item, "name", .{ .string = name });
-            try r.put(item, "arguments", .{ .string = "" });
+            try r.put(item, "name", .{ .string = if (binding) |b| b.name else name });
+            if (binding) |b| if (b.namespace) |ns| try r.put(item, "namespace", .{ .string = ns });
+            try r.put(item, if (custom) "input" else "arguments", .{ .string = "" });
             try r.put(item, "status", .{ .string = "in_progress" });
         }
         r.items.append(r.a, item) catch return error.Closed;
@@ -326,7 +338,17 @@ const Reply = struct {
         try r.put(item, "status", .{ .string = status });
         const where_id = item.get("id").?;
         const where_index = try r.int(r.index(item));
-        if (std.mem.eql(u8, item.get("type").?.string, "function_call")) {
+        if (std.mem.eql(u8, item.get("type").?.string, "custom_tool_call")) {
+            const arguments = if (r.custom_arguments.get(item)) |buffer| buffer.items else "{}";
+            const input = compat.customInput(r.cx, arguments) catch {
+                try r.put(item, "status", .{ .string = "incomplete" });
+                try r.fail(.{ .string = r.cx.message });
+                return error.Closed;
+            };
+            try r.put(item, "input", .{ .string = input });
+            try r.event("response.custom_tool_call_input.delta", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "delta", .{ .string = input } } });
+            try r.event("response.custom_tool_call_input.done", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "input", .{ .string = input } } });
+        } else if (std.mem.eql(u8, item.get("type").?.string, "function_call")) {
             try r.event("response.function_call_arguments.done", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "name", item.get("name").? }, .{ "arguments", item.get("arguments").? } });
         } else {
             const part = item.get("content").?.array[0].object;
@@ -375,8 +397,14 @@ const Reply = struct {
                 break :blk made;
             };
             if (textOf(function.get("arguments"))) |args| {
-                try r.put(item, "arguments", .{ .string = std.mem.concat(r.a, u8, &.{ item.get("arguments").?.string, args }) catch return error.Closed });
-                try r.event("response.function_call_arguments.delta", &.{ .{ "item_id", item.get("id").? }, .{ "output_index", try r.int(r.index(item)) }, .{ "delta", .{ .string = args } } });
+                if (std.mem.eql(u8, item.get("type").?.string, "custom_tool_call")) {
+                    const entry = r.custom_arguments.getOrPut(r.a, item) catch return error.Closed;
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    entry.value_ptr.appendSlice(r.a, args) catch return error.Closed;
+                } else {
+                    try r.put(item, "arguments", .{ .string = std.mem.concat(r.a, u8, &.{ item.get("arguments").?.string, args }) catch return error.Closed });
+                    try r.event("response.function_call_arguments.delta", &.{ .{ "item_id", item.get("id").? }, .{ "output_index", try r.int(r.index(item)) }, .{ "delta", .{ .string = args } } });
+                }
             }
         }
     }

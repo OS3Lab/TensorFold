@@ -1,3 +1,5 @@
+> OS3Lab branch: this fork preserves the deployed V4.1 Flash 1017 recipe and adds Codex Responses tool compatibility. See [OS3Lab changes and validation](README.os3lab.md).
+
 # TensorFold
 
 > **This is a fork of TensorFold 1.0.2** by Bertholomus AI, not the upstream project. It adds the `dsv41` family:

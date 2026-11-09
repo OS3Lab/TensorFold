@@ -5,6 +5,7 @@ const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const pyrepr = @import("pyrepr.zig");
 const tool_specs = @import("tool_specs.zig");
+const compat = @import("responses_compat.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -94,7 +95,7 @@ pub fn messages(cx: *Cx, items: []const Value) errors.Refused![]Value {
     const a = cx.a;
     var out: std.ArrayList(*json.Object) = .empty;
     var thought: ?[]const u8 = null;
-    for (items) |item| {
+    for (try compat.history(cx, items)) |item| {
         if (item != .object) return cx.refuse("each input item must be an object");
         var kind: ?Value = item.get("type");
         if (kind == null or !kind.?.truthy()) kind = if (item.has("role")) Value{ .string = "message" } else null;
@@ -249,21 +250,26 @@ fn format(cx: *Cx, text: ?Value) errors.Refused!?Value {
 }
 
 /// A Responses request as the chat completion that runs it; ``history`` reads a stored conversation.
+const include_values = [_][]const u8{ "code_interpreter_call.outputs", "computer_call_output.output.image_url", "file_search_call.results", "message.input_image.image_url", "message.output_text.logprobs", "reasoning.encrypted_content", "web_search_call.action.sources", "web_search_call.results" };
+
+/// Accept OpenAI's optional output selectors without fabricating outputs this engine does not provide.
+pub fn include(cx: *Cx, given: Value) errors.Refused!void {
+    if (given == .null) return;
+    if (given != .array) return cx.refuse("include must be a list of strings");
+    for (given.array) |value| {
+        if (value != .string) return cx.refuse("include must be a list of strings");
+        for (include_values) |known| {
+            if (std.mem.eql(u8, value.string, known)) break;
+        } else return cx.fail(.request, "include has no value '{s}'", .{value.string});
+    }
+}
+
 pub fn translate(cx: *Cx, body: Value, history: anytype) errors.Refused!Request {
     const a = cx.a;
     if (body != .object) return cx.refuse("the request body must be a JSON object");
     try fields.probabilityOptions(cx, body);
     for (refused) |r| if (json.truthyField(body, r[0])) return cx.refuse(r[1]);
-    if (body.get("include")) |inc| if (inc.truthy()) {
-        var parts: std.ArrayList([]const u8) = .empty;
-        switch (inc) {
-            .array => |items| for (items) |i| try parts.append(a, try tool_specs.pyStr(a, i)),
-            .object => |o| for (o.keys()) |k| try parts.append(a, k),
-            .string => |s| for (0..s.len) |i| try parts.append(a, s[i .. i + 1]),
-            else => try parts.append(a, try tool_specs.pyStr(a, inc)),
-        }
-        return cx.fail(.request, "include is not supported ({s}): reasoning comes as text in its reasoning item, and nothing is encrypted", .{try std.mem.join(a, ", ", parts.items)});
-    };
+    if (body.get("include")) |inc| try include(cx, inc);
     if (body.field("truncation")) |t| if (!(t == .string and std.mem.eql(u8, t.string, "disabled"))) return cx.refuse("truncation must be \"disabled\": a prompt too long for the context is refused");
     if (json.truthyField(body, "top_logprobs")) return cx.refuse("top_logprobs is not supported");
     const meta_raw = body.get("metadata");
